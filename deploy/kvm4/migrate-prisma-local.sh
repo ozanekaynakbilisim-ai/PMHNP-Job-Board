@@ -6,7 +6,11 @@ SUPABASE_DIR="/opt/healthcare-supabase"
 SUPABASE_NETWORK="healthcare-supabase_default"
 NODE_MODULES_VOLUME="healthcare-job-board-node-modules"
 NODE_IMAGE="node:22-bookworm"
-KNOWN_FAILED_MIGRATION="20260430_add_saved_candidate_tags"
+BOOTSTRAP_SQL="${APP_DIR}/prisma/migrations/20260430_01_create_all_db_push_tables_for_fresh_db/migration.sql"
+KNOWN_FAILED_MIGRATIONS=(
+  "20260430_add_saved_candidate_tags"
+  "20260501_feedback_userid_and_testimonials"
+)
 
 if [[ "${EUID}" -ne 0 ]]; then
   echo "ERROR: run as root."
@@ -21,12 +25,12 @@ done
 [[ -f "${SUPABASE_DIR}/.env" ]] || { echo "ERROR: Supabase .env not found at ${SUPABASE_DIR}/.env"; exit 3; }
 [[ -f "${APP_DIR}/prisma/schema.prisma" ]] || { echo "ERROR: Prisma schema not found"; exit 4; }
 [[ -f "${APP_DIR}/package-lock.json" ]] || { echo "ERROR: package-lock.json not found"; exit 5; }
+[[ -f "${BOOTSTRAP_SQL}" ]] || { echo "ERROR: fresh-DB bootstrap SQL not found: ${BOOTSTRAP_SQL}"; exit 11; }
 
 echo
 printf '%s\n' '=== HEALTHCARE PRISMA MIGRATION ==='
 printf 'Timestamp: '; date -Is 2>/dev/null || date
 
-# Supabase health guard.
 if ! docker ps --format '{{.Names}} {{.Status}}' | grep -Eq '^supabase-db .*\(healthy\)'; then
   echo "ERROR: supabase-db is not running healthy."
   docker ps -a --format 'table {{.Names}}\t{{.Status}}' | grep -E 'NAMES|supabase-' || true
@@ -38,8 +42,6 @@ if ! docker network inspect "${SUPABASE_NETWORK}" >/dev/null 2>&1; then
   exit 7
 fi
 
-# Read only the generated database password. Supabase's official generator
-# emits POSTGRES_PASSWORD as hex, so it is URL-safe without transformation.
 POSTGRES_PASSWORD="$(grep -E '^POSTGRES_PASSWORD=' "${SUPABASE_DIR}/.env" | head -n1 | cut -d= -f2-)"
 if [[ -z "${POSTGRES_PASSWORD}" ]]; then
   echo "ERROR: POSTGRES_PASSWORD is empty."
@@ -48,24 +50,59 @@ fi
 
 DB_URL="postgresql://postgres:${POSTGRES_PASSWORD}@supabase-db:5432/postgres"
 
-# Prisma blocks all later migrations after any failed migration. There is one
-# known historical fresh-DB failure in this upstream repo:
-# 20260430_add_saved_candidate_tags assumes saved_candidates already exists,
-# because that table originally reached production via `prisma db push`.
-# Our earlier idempotent bootstrap migration now fixes the ordering for clean
-# installs. If THIS exact failure is recorded from a previous run, mark only
-# that migration rolled back so Prisma may replay the corrected chain.
-RECOVER_KNOWN_FAILURE=0
+# The upstream project historically created 18 tables via `prisma db push`.
+# Later migrations assume some of those relations already exist, while the
+# formal repair migration that creates them sits much later (20260611).
+# Apply our idempotent bootstrap SQL first so a genuinely fresh DB matches the
+# historical production preconditions before Prisma replays the chain.
+echo
+printf '%s\n' '--- Fresh DB db-push baseline bootstrap ---'
+docker exec -i supabase-db psql -U postgres -d postgres -v ON_ERROR_STOP=1 < "${BOOTSTRAP_SQL}" >/dev/null
+echo "Bootstrap tables ensured (idempotent; no data deleted)."
+
+# Collect unresolved failed migration names, and recover only the explicitly
+# reviewed historical fresh-DB failures. Unknown failures are never skipped.
+RECOVER_LIST=()
 if docker exec supabase-db psql -U postgres -d postgres -tAc \
-  "SELECT CASE WHEN to_regclass('public._prisma_migrations') IS NOT NULL AND EXISTS (SELECT 1 FROM public._prisma_migrations WHERE migration_name='${KNOWN_FAILED_MIGRATION}' AND finished_at IS NULL AND rolled_back_at IS NULL) THEN 1 ELSE 0 END;" \
-  2>/dev/null | grep -q '^1$'; then
-  RECOVER_KNOWN_FAILURE=1
-  echo
-  echo "Detected the known failed fresh-database migration: ${KNOWN_FAILED_MIGRATION}"
-  echo "It will be marked rolled back with Prisma before replaying the corrected migration chain."
+  "SELECT CASE WHEN to_regclass('public._prisma_migrations') IS NULL THEN '' ELSE COALESCE(string_agg(migration_name, ',' ORDER BY started_at), '') END FROM public._prisma_migrations WHERE finished_at IS NULL AND rolled_back_at IS NULL;" \
+  >/tmp/healthcare-prisma-failures.txt 2>/dev/null; then
+  UNRESOLVED="$(tr -d '[:space:]' </tmp/healthcare-prisma-failures.txt)"
+else
+  UNRESOLVED=""
+fi
+rm -f /tmp/healthcare-prisma-failures.txt
+
+if [[ -n "${UNRESOLVED}" ]]; then
+  IFS=',' read -r -a FAILED_ARRAY <<< "${UNRESOLVED}"
+  for failed in "${FAILED_ARRAY[@]}"; do
+    known=0
+    for allowed in "${KNOWN_FAILED_MIGRATIONS[@]}"; do
+      if [[ "${failed}" == "${allowed}" ]]; then
+        known=1
+        RECOVER_LIST+=("${failed}")
+        break
+      fi
+    done
+    if [[ "${known}" -ne 1 ]]; then
+      echo "ERROR: unknown unresolved Prisma migration failure: ${failed}"
+      echo "Refusing to auto-resolve it. Inspect before continuing."
+      exit 12
+    fi
+  done
 fi
 
-# Cache npm dependencies in a Docker volume. No host Node installation needed.
+if [[ "${#RECOVER_LIST[@]}" -gt 0 ]]; then
+  echo
+  echo "Detected reviewed historical fresh-database failure(s):"
+  printf ' - %s\n' "${RECOVER_LIST[@]}"
+  echo "Only these will be marked rolled back before replaying the corrected chain."
+fi
+
+RECOVER_CSV=""
+if [[ "${#RECOVER_LIST[@]}" -gt 0 ]]; then
+  RECOVER_CSV="$(IFS=,; echo "${RECOVER_LIST[*]}")"
+fi
+
 docker volume inspect "${NODE_MODULES_VOLUME}" >/dev/null 2>&1 || docker volume create "${NODE_MODULES_VOLUME}" >/dev/null
 
 echo
@@ -82,8 +119,7 @@ docker run --rm \
   -e NODE_ENV=development \
   -e DATABASE_URL="${DB_URL}" \
   -e DIRECT_URL="${DB_URL}" \
-  -e RECOVER_KNOWN_FAILURE="${RECOVER_KNOWN_FAILURE}" \
-  -e KNOWN_FAILED_MIGRATION="${KNOWN_FAILED_MIGRATION}" \
+  -e RECOVER_CSV="${RECOVER_CSV}" \
   "${NODE_IMAGE}" \
   bash -lc '
     set -Eeuo pipefail
@@ -91,10 +127,13 @@ docker run --rm \
     npm --version
     npm ci --no-audit --no-fund
 
-    if [[ "${RECOVER_KNOWN_FAILURE}" == "1" ]]; then
-      echo
-      echo "--- Recovering known failed migration ---"
-      npx prisma migrate resolve --rolled-back "${KNOWN_FAILED_MIGRATION}"
+    if [[ -n "${RECOVER_CSV}" ]]; then
+      IFS="," read -r -a recover <<< "${RECOVER_CSV}"
+      for migration in "${recover[@]}"; do
+        echo
+        echo "--- Recovering reviewed failed migration: ${migration} ---"
+        npx prisma migrate resolve --rolled-back "${migration}"
+      done
     fi
 
     echo
