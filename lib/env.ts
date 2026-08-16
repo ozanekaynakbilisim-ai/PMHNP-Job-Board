@@ -14,6 +14,10 @@ const envSchema = z.object({
 
     // Supabase (required for auth)
     NEXT_PUBLIC_SUPABASE_URL: z.string().url('NEXT_PUBLIC_SUPABASE_URL must be a valid URL'),
+    // Self-hosted server-side override. Browser code continues to use
+    // NEXT_PUBLIC_SUPABASE_URL; server code can stay entirely on Docker's
+    // private network with this value.
+    SUPABASE_INTERNAL_URL: z.string().url('SUPABASE_INTERNAL_URL must be a valid URL').optional(),
     NEXT_PUBLIC_SUPABASE_ANON_KEY: z.string().min(1, 'NEXT_PUBLIC_SUPABASE_ANON_KEY is required'),
     SUPABASE_SERVICE_ROLE_KEY: z.string().min(1, 'SUPABASE_SERVICE_ROLE_KEY is required'),
 
