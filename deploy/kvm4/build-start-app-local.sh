@@ -84,16 +84,19 @@ fi
 
 DB_URL="postgresql://postgres:${POSTGRES_PASSWORD}@supabase-db:5432/postgres"
 
+# Browser traffic stays same-origin at localhost:3100. The Next.js proxy route
+# forwards /api/supabase/* privately to api-gw:8000 inside Docker. This avoids
+# local CSP/CORS issues and means port 8000 never needs to be exposed/tunnelled.
 cat > "${APP_ENV}" <<EOF
 NODE_ENV=production
 DATABASE_URL=${DB_URL}
 DIRECT_URL=${DB_URL}
-NEXT_PUBLIC_SUPABASE_URL=http://127.0.0.1:8000
+NEXT_PUBLIC_SUPABASE_URL=http://localhost:${APP_PORT}/api/supabase
 SUPABASE_INTERNAL_URL=http://api-gw:8000
 NEXT_PUBLIC_SUPABASE_ANON_KEY=${ANON_KEY}
 SUPABASE_SERVICE_ROLE_KEY=${SERVICE_ROLE_KEY}
-NEXT_PUBLIC_APP_URL=http://127.0.0.1:${APP_PORT}
-NEXT_PUBLIC_BASE_URL=http://127.0.0.1:${APP_PORT}
+NEXT_PUBLIC_APP_URL=http://localhost:${APP_PORT}
+NEXT_PUBLIC_BASE_URL=http://localhost:${APP_PORT}
 CRON_SECRET=${CRON_SECRET}
 EMAIL_HASH_SALT=${EMAIL_HASH_SALT}
 SHORTLINK_HASH_SECRET=${SHORTLINK_HASH_SECRET}
@@ -111,9 +114,10 @@ docker volume inspect "${NODE_MODULES_VOLUME}" >/dev/null 2>&1 || docker volume 
 
 echo
 echo '--- Building Next.js in an isolated Node container ---'
-echo "Public preview URL: http://127.0.0.1:${APP_PORT}"
-echo 'Supabase browser URL: http://127.0.0.1:8000'
+echo "Public preview URL: http://localhost:${APP_PORT}"
+echo "Supabase browser URL: http://localhost:${APP_PORT}/api/supabase (same-origin proxy)"
 echo 'Supabase server URL:  http://api-gw:8000 (Docker private network)'
+echo 'Port 8000 browser tunnel: no longer required'
 echo 'Paid posting: disabled'
 echo 'AI candidate features: disabled until OmniRoute providers are connected'
 echo 'Email delivery: disabled; build-only Resend placeholder will NOT be stored in runtime env'
@@ -180,6 +184,13 @@ if [[ -f /tmp/healthcare-home.html ]]; then
   echo
 fi
 
+# Verify the new same-origin Supabase proxy without printing any secrets.
+auth_proxy_code="$(curl -sS -o /tmp/healthcare-auth-settings.json -w '%{http_code}' --max-time 10 \
+  -H "apikey: ${ANON_KEY}" \
+  -H "Authorization: Bearer ${ANON_KEY}" \
+  "http://127.0.0.1:${APP_PORT}/api/supabase/auth/v1/settings" 2>/dev/null || true)"
+echo "Supabase auth proxy HTTP ${auth_proxy_code}"
+
 echo
 echo '--- Recent app logs ---'
 docker logs --tail 100 "${APP_CONTAINER}" 2>&1 || true
@@ -203,6 +214,7 @@ fi
 
 echo
 echo "RESULT: Healthcare Job Board is running locally on 127.0.0.1:${APP_PORT}."
+echo 'Browser Supabase requests now use the same-origin /api/supabase proxy.'
 echo 'No public web port was opened by this stage.'
-echo 'Next step: SSH preview, then domain/Caddy/HTTPS and production Supabase URL.'
+echo 'Next step after auth smoke test: domain/Caddy/HTTPS and production Supabase URL.'
 printf '%s\n' '=== END HEALTHCARE NEXT.JS LOCAL BUILD + START ==='
