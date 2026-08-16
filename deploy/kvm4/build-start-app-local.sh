@@ -116,6 +116,7 @@ echo 'Supabase browser URL: http://127.0.0.1:8000'
 echo 'Supabase server URL:  http://api-gw:8000 (Docker private network)'
 echo 'Paid posting: disabled'
 echo 'AI candidate features: disabled until OmniRoute providers are connected'
+echo 'Email delivery: disabled; build-only Resend placeholder will NOT be stored in runtime env'
 
 docker rm -f healthcare-next-build >/dev/null 2>&1 || true
 
@@ -124,6 +125,7 @@ docker run --rm \
   --network "${SUPABASE_NETWORK}" \
   --env-file "${APP_ENV}" \
   -e NODE_OPTIONS=--max-old-space-size=4096 \
+  -e RESEND_API_KEY=re_build_only_placeholder_not_for_delivery \
   -v "${APP_DIR}:/app" \
   -v "${NODE_MODULES_VOLUME}:/app/node_modules" \
   -w /app \
