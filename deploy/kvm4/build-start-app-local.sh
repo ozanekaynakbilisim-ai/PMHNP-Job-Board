@@ -130,7 +130,10 @@ docker run --rm \
   "${NODE_IMAGE}" \
   bash -lc '
     set -Eeuo pipefail
-    npm ci --no-audit --no-fund
+    # NODE_ENV=production is required for a real production Next.js build,
+    # but npm otherwise omits devDependencies. next.config.ts imports build-only
+    # tooling such as @next/bundle-analyzer, so explicitly include dev deps here.
+    npm ci --include=dev --no-audit --no-fund
     npm run build
   '
 
