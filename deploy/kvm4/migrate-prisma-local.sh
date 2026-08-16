@@ -6,6 +6,7 @@ SUPABASE_DIR="/opt/healthcare-supabase"
 SUPABASE_NETWORK="healthcare-supabase_default"
 NODE_MODULES_VOLUME="healthcare-job-board-node-modules"
 NODE_IMAGE="node:22-bookworm"
+KNOWN_FAILED_MIGRATION="20260430_add_saved_candidate_tags"
 
 if [[ "${EUID}" -ne 0 ]]; then
   echo "ERROR: run as root."
@@ -47,6 +48,23 @@ fi
 
 DB_URL="postgresql://postgres:${POSTGRES_PASSWORD}@supabase-db:5432/postgres"
 
+# Prisma blocks all later migrations after any failed migration. There is one
+# known historical fresh-DB failure in this upstream repo:
+# 20260430_add_saved_candidate_tags assumes saved_candidates already exists,
+# because that table originally reached production via `prisma db push`.
+# Our earlier idempotent bootstrap migration now fixes the ordering for clean
+# installs. If THIS exact failure is recorded from a previous run, mark only
+# that migration rolled back so Prisma may replay the corrected chain.
+RECOVER_KNOWN_FAILURE=0
+if docker exec supabase-db psql -U postgres -d postgres -tAc \
+  "SELECT CASE WHEN to_regclass('public._prisma_migrations') IS NOT NULL AND EXISTS (SELECT 1 FROM public._prisma_migrations WHERE migration_name='${KNOWN_FAILED_MIGRATION}' AND finished_at IS NULL AND rolled_back_at IS NULL) THEN 1 ELSE 0 END;" \
+  2>/dev/null | grep -q '^1$'; then
+  RECOVER_KNOWN_FAILURE=1
+  echo
+  echo "Detected the known failed fresh-database migration: ${KNOWN_FAILED_MIGRATION}"
+  echo "It will be marked rolled back with Prisma before replaying the corrected migration chain."
+fi
+
 # Cache npm dependencies in a Docker volume. No host Node installation needed.
 docker volume inspect "${NODE_MODULES_VOLUME}" >/dev/null 2>&1 || docker volume create "${NODE_MODULES_VOLUME}" >/dev/null
 
@@ -64,12 +82,21 @@ docker run --rm \
   -e NODE_ENV=development \
   -e DATABASE_URL="${DB_URL}" \
   -e DIRECT_URL="${DB_URL}" \
+  -e RECOVER_KNOWN_FAILURE="${RECOVER_KNOWN_FAILURE}" \
+  -e KNOWN_FAILED_MIGRATION="${KNOWN_FAILED_MIGRATION}" \
   "${NODE_IMAGE}" \
   bash -lc '
     set -Eeuo pipefail
     node --version
     npm --version
     npm ci --no-audit --no-fund
+
+    if [[ "${RECOVER_KNOWN_FAILURE}" == "1" ]]; then
+      echo
+      echo "--- Recovering known failed migration ---"
+      npx prisma migrate resolve --rolled-back "${KNOWN_FAILED_MIGRATION}"
+    fi
+
     echo
     echo "--- Prisma migrate deploy ---"
     npx prisma migrate deploy
@@ -84,10 +111,17 @@ docker run --rm \
 echo
 printf '%s\n' '--- Database verification ---'
 PUBLIC_TABLES="$(docker exec supabase-db psql -U postgres -d postgres -tAc "SELECT count(*) FROM information_schema.tables WHERE table_schema='public';" | tr -d '[:space:]')"
-MIGRATION_ROWS="$(docker exec supabase-db psql -U postgres -d postgres -tAc "SELECT CASE WHEN to_regclass('public._prisma_migrations') IS NULL THEN 0 ELSE (SELECT count(*) FROM public._prisma_migrations) END;" | tr -d '[:space:]')"
+MIGRATION_ROWS="$(docker exec supabase-db psql -U postgres -d postgres -tAc "SELECT CASE WHEN to_regclass('public._prisma_migrations') IS NULL THEN 0 ELSE (SELECT count(*) FROM public._prisma_migrations WHERE finished_at IS NOT NULL AND rolled_back_at IS NULL) END;" | tr -d '[:space:]')"
+FAILED_ROWS="$(docker exec supabase-db psql -U postgres -d postgres -tAc "SELECT CASE WHEN to_regclass('public._prisma_migrations') IS NULL THEN 0 ELSE (SELECT count(*) FROM public._prisma_migrations WHERE finished_at IS NULL AND rolled_back_at IS NULL) END;" | tr -d '[:space:]')"
 
 echo "Public schema tables: ${PUBLIC_TABLES:-unknown}"
-echo "Applied Prisma migrations: ${MIGRATION_ROWS:-unknown}"
+echo "Successfully applied Prisma migrations: ${MIGRATION_ROWS:-unknown}"
+echo "Unresolved failed Prisma migrations: ${FAILED_ROWS:-unknown}"
+
+if [[ "${FAILED_ROWS:-1}" != "0" ]]; then
+  echo "ERROR: unresolved Prisma migration failures remain."
+  exit 10
+fi
 
 echo
 printf '%s\n' '--- Supabase ports remain localhost-only ---'
